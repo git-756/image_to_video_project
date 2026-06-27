@@ -1,9 +1,14 @@
 import os
 import sys
 import subprocess
+import tempfile
 from pathlib import Path
-from datetime import datetime
-from PIL import Image, ExifTags
+from datetime import datetime, timezone
+from PIL import Image, ExifTags, ImageOps
+
+# HEICサポート用のライブラリをインポートし、Pillowに登録
+import pillow_heif
+pillow_heif.register_heif_opener()
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,7 +22,8 @@ def get_oldest_creation_date(image_paths):
     for path in image_paths:
         try:
             with Image.open(path) as img:
-                exif = img._getexif()
+                # HEIC等での互換性を高めるため、プライベートメソッド _getexif() から getexif() に変更
+                exif = img.getexif()
                 if exif:
                     for tag_id, value in exif.items():
                         tag = ExifTags.TAGS.get(tag_id, tag_id)
@@ -29,8 +35,13 @@ def get_oldest_creation_date(image_paths):
             pass
             
     if oldest_date is None and image_paths:
-        birth_times = [os.stat(p).st_birthtime for p in image_paths]
-        oldest_date = datetime.fromtimestamp(min(birth_times))
+        try:
+            birth_times = [os.stat(p).st_birthtime for p in image_paths]
+            oldest_date = datetime.fromtimestamp(min(birth_times))
+        except AttributeError:
+            # OSや環境によって st_birthtime が無い場合のフォールバック
+            m_times = [os.path.getmtime(p) for p in image_paths]
+            oldest_date = datetime.fromtimestamp(min(m_times))
         
     return oldest_date
 
@@ -39,7 +50,6 @@ class VideoWorker(QThread):
     """動画生成を裏で行うためのワーカースレッド"""
     progress_updated = Signal(int)
     log_updated = Signal(str)
-    finished = Signal()
     error_occurred = Signal(str)
 
     def __init__(self, parent_dir):
@@ -53,7 +63,6 @@ class VideoWorker(QThread):
 
             if total_folders == 0:
                 self.log_updated.emit("サブフォルダが見つかりません。")
-                self.finished.emit()
                 return
 
             output_dir = self.parent_dir.parent / "OutputVideos"
@@ -62,9 +71,10 @@ class VideoWorker(QThread):
 
             for i, subfolder_path in enumerate(subfolders):
                 subfolder_name = subfolder_path.name
+                # 対象拡張子に .heic と .heif を追加
                 image_paths = sorted([
                     p for p in subfolder_path.iterdir() 
-                    if p.is_file() and p.suffix.lower() in ['.jpg', '.jpeg', '.png']
+                    if p.is_file() and p.suffix.lower() in ['.jpg', '.jpeg', '.png', '.heic', '.heif']
                 ])
                 
                 if not image_paths:
@@ -75,56 +85,106 @@ class VideoWorker(QThread):
                 self.log_updated.emit(f"処理中: {subfolder_name} ({len(image_paths)}枚)")
 
                 oldest_date = get_oldest_creation_date(image_paths)
-                metadata_time = oldest_date.strftime("%Y-%m-%dT%H:%M:%S.000000Z") if oldest_date else ""
-
-                concat_file_path = subfolder_path / "ffmpeg_concat_list.txt"
-                with open(concat_file_path, "w", encoding="utf-8") as f:
-                    for img_path in image_paths:
-                        f.write(f"file '{img_path.resolve()}'\n")
-                        f.write("duration 0.5\n")
-                    # concatの仕様上、最後の画像を記述（durationなし）
-                    f.write(f"file '{image_paths[-1].resolve()}'\n")
-
-                output_filename = f"{parent_name}_{subfolder_name}.mp4"
-                output_filepath = output_dir / output_filename
-
-                # 【修正1】fpsを10に変更（容量削減）
-                vf_filter = "fps=10,scale=3840:2160:force_original_aspect_ratio=decrease,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:color=black"
                 
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "concat",
-                    "-safe", "0",
-                    "-i", str(concat_file_path),
-                    "-vf", vf_filter,
-                    # 【修正2】H.265 (HEVC) のハードウェアエンコーダーを指定
-                    "-c:v", "hevc_videotoolbox", 
-                    # 【修正3】ビットレートを20Mから5Mに大幅ダウン（H.265かつ静止画メインならこれで十分綺麗です）
-                    "-b:v", "5M",
-                    # 【追加】AppleのQuickTime等でH.265として正しく認識させるためのタグ
-                    "-tag:v", "hvc1",
-                    "-pix_fmt", "yuv420p",
-                ]
-                
-                if metadata_time:
-                    cmd.extend(["-metadata", f"creation_time={metadata_time}"])
+                if oldest_date:
+                    local_tz = datetime.now().astimezone().tzinfo
+                    dt_aware = oldest_date.replace(tzinfo=local_tz)
+                    dt_utc = dt_aware.astimezone(timezone.utc)
+                    metadata_time = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000000Z")
+                else:
+                    metadata_time = ""
+
+                self.log_updated.emit("すべての画像を4Kサイズに最適化中...")
+
+                # 一時フォルダを作成して、画像をすべて同じサイズ(3840x2160)に統一する
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_dir_path = Path(temp_dir)
+                    temp_image_paths = []
+
+                    for idx, img_path in enumerate(image_paths):
+                        try:
+                            with Image.open(img_path) as img:
+                                # 縦写真が横に寝ないようにEXIFの回転情報を適用（HEICも対応）
+                                img = ImageOps.exif_transpose(img)
+                                # 3840x2160にリサイズ＆余白を黒で塗りつぶし
+                                img_padded = ImageOps.pad(img, (3840, 2160), color=(0, 0, 0))
+                                # エラー防止のためRGBモードに統一
+                                if img_padded.mode != 'RGB':
+                                    img_padded = img_padded.convert('RGB')
+                                
+                                temp_img_path = temp_dir_path / f"img_{idx:04d}.jpg"
+                                img_padded.save(temp_img_path, "JPEG", quality=95)
+                                temp_image_paths.append(temp_img_path)
+                        except Exception as e:
+                            self.log_updated.emit(f"画像読み込みエラー ({img_path.name}): {e}")
+                            continue
+
+                    if not temp_image_paths:
+                        self.log_updated.emit("有効な画像がありませんでした。スキップします。")
+                        continue
+
+                    # 元の画像の代わりに、サイズ統一済みの一時画像を使ってリストを作成
+                    concat_file_path = subfolder_path / "ffmpeg_concat_list.txt"
+                    with open(concat_file_path, "w", encoding="utf-8") as f:
+                        for img_path in temp_image_paths:
+                            f.write(f"file '{img_path.resolve()}'\n")
+                            f.write("duration 1.0\n") # 1枚につき1秒
+                        f.write(f"file '{temp_image_paths[-1].resolve()}'\n")
+
+                    output_filename = f"{parent_name}_{subfolder_name}.mp4"
+                    output_filepath = output_dir / output_filename
+                    log_file_path = output_dir / f"{output_filename}_ffmpeg_log.txt"
+
+                    # 画像はすでに4K化されているので、FFmpeg側でのリサイズはせずピクセルフォーマットと24fpsのみ指定
+                    vf_filter = "format=yuv420p,fps=10"
                     
-                cmd.append(str(output_filepath))
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-f", "concat",
+                        "-safe", "0",
+                        "-i", str(concat_file_path),
+                        "-vf", vf_filter,
+                        "-c:v", "hevc_videotoolbox", 
+                        "-b:v", "5M",
+                        "-tag:v", "hvc1",
+                        "-pix_fmt", "yuv420p",
+                    ]
+                    
+                    if metadata_time:
+                        cmd.extend(["-metadata", f"creation_time={metadata_time}"])
+                        
+                    cmd.append(str(output_filepath))
 
-                try:
-                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    self.log_updated.emit(f"完了: {output_filename}")
-                except subprocess.CalledProcessError:
-                    self.log_updated.emit(f"エラー: {subfolder_name} の処理に失敗しました。")
-                finally:
-                    if concat_file_path.exists():
-                        concat_file_path.unlink()
+                    try:
+                        result = subprocess.run(
+                            cmd, 
+                            stdout=subprocess.PIPE, 
+                            stderr=subprocess.PIPE, 
+                            text=True
+                        )
+                        
+                        with open(log_file_path, "w", encoding="utf-8") as lf:
+                            lf.write(f"--- 実行したコマンド ---\n{' '.join(cmd)}\n\n")
+                            lf.write(f"--- FFmpeg ログ ---\n{result.stderr}")
 
-                # 進捗バーの更新
+                        if result.returncode == 0:
+                            self.log_updated.emit(f"完了: {output_filename}")
+                            if "Drop" in result.stderr or "drop" in result.stderr or "Error" in result.stderr:
+                                self.log_updated.emit(f"⚠️ 警告: ログにDropやErrorの記載があります。")
+                        else:
+                            self.log_updated.emit(f"エラー: {subfolder_name} の処理に失敗しました。")
+                            
+                        self.log_updated.emit(f"詳細はログを確認してください: {log_file_path.name}")
+
+                    except Exception as e:
+                        self.log_updated.emit(f"実行エラー: {str(e)}")
+                    finally:
+                        if concat_file_path.exists():
+                            concat_file_path.unlink()
+
                 self.progress_updated.emit(int(((i + 1) / total_folders) * 100))
 
             self.log_updated.emit(f"\nすべての処理が完了しました！\n出力先: {output_dir}")
-            self.finished.emit()
 
         except Exception as e:
             self.error_occurred.emit(str(e))
@@ -138,7 +198,6 @@ class MainWindow(QMainWindow):
 
         self.selected_folder = ""
 
-        # UI要素の作成
         self.folder_label = QLabel("対象の親フォルダを選択してください")
         self.select_btn = QPushButton("フォルダを選択")
         self.select_btn.clicked.connect(self.select_folder)
@@ -153,7 +212,6 @@ class MainWindow(QMainWindow):
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
 
-        # レイアウトの組み立て
         top_layout = QHBoxLayout()
         top_layout.addWidget(self.folder_label)
         top_layout.addWidget(self.select_btn)
@@ -182,11 +240,10 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.log_output.append("--- 処理を開始します ---")
 
-        # ワーカースレッドの準備と開始
         self.worker = VideoWorker(self.selected_folder)
         self.worker.progress_updated.connect(self.progress_bar.setValue)
         self.worker.log_updated.connect(self.log_output.append)
-        self.worker.finished.connect(self.processing_finished)
+        self.worker.finished.connect(self.processing_finished) 
         self.worker.error_occurred.connect(self.show_error)
         self.worker.start()
 
