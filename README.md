@@ -73,3 +73,7 @@ brew reinstall ffmpeg
 ### 動画ができずに「エラー」と出る
 
 `output_video/` の `<動画名>_ffmpeg_log.txt` に、ffmpeg が出したエラーが残っています。
+
+## ライセンス
+
+[MIT License](LICENSE)

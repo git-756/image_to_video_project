@@ -14,3 +14,6 @@ wheels/
 *.png
 *.mp4
 *.MOV
+
+# macOS
+.DS_Store
