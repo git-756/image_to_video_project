@@ -1,7 +1,7 @@
 [project]
 name = "image-to-video-project"
 version = "0.1.0"
-description = "Add your description here"
+description = "フォルダごとの写真を 4K のスライドショー動画にする GUI アプリ"
 authors = [
     { name = "SamuraiHumanGo_Mac", email = "gotechsamurai@samurai-human-go.com" }
 ]
@@ -13,16 +13,6 @@ dependencies = [
 readme = "README.md"
 requires-python = ">= 3.12"
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.rye]
-managed = true
-dev-dependencies = []
-
-[tool.hatch.metadata]
-allow-direct-references = true
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/image_to_video_project"]
+[tool.uv]
+# パッケージとして配らず、src/main.py をスクリプトとして実行する
+package = false

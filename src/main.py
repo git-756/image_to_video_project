@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime, timezone
 from PIL import Image, ExifTags, ImageOps
@@ -16,6 +17,24 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QThread, Signal
 
+# 画像の4K化を並列で行うスレッド数（Pillowは処理中にGILを解放するのでスレッドで並列になる）
+MAX_WORKERS = os.cpu_count() or 4
+
+
+def prepare_image(img_path, temp_img_path):
+    """1枚の画像を3840x2160に統一してJPEGで保存する"""
+    with Image.open(img_path) as img:
+        # 縦写真が横に寝ないようにEXIFの回転情報を適用（HEICも対応）
+        img = ImageOps.exif_transpose(img)
+        # 3840x2160にリサイズ＆余白を黒で塗りつぶし
+        img_padded = ImageOps.pad(img, (3840, 2160), color=(0, 0, 0))
+        # エラー防止のためRGBモードに統一
+        if img_padded.mode != 'RGB':
+            img_padded = img_padded.convert('RGB')
+        img_padded.save(temp_img_path, "JPEG", quality=95)
+    return temp_img_path
+
+
 def get_oldest_creation_date(image_paths):
     """画像群から最も古い撮影日時（EXIF）を取得する"""
     oldest_date = None
@@ -23,14 +42,14 @@ def get_oldest_creation_date(image_paths):
         try:
             with Image.open(path) as img:
                 # HEIC等での互換性を高めるため、プライベートメソッド _getexif() から getexif() に変更
-                exif = img.getexif()
-                if exif:
-                    for tag_id, value in exif.items():
-                        tag = ExifTags.TAGS.get(tag_id, tag_id)
-                        if tag == 'DateTimeOriginal':
-                            dt = datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
-                            if oldest_date is None or dt < oldest_date:
-                                oldest_date = dt
+                # 撮影日時は getexif() の直下ではなく Exif IFD の中にあるので、そこから読む
+                exif_ifd = img.getexif().get_ifd(ExifTags.IFD.Exif)
+                value = (exif_ifd.get(ExifTags.Base.DateTimeOriginal)
+                         or exif_ifd.get(ExifTags.Base.DateTimeDigitized))
+                if value:
+                    dt = datetime.strptime(value.strip("\x00 "), "%Y:%m:%d %H:%M:%S")
+                    if oldest_date is None or dt < oldest_date:
+                        oldest_date = dt
         except Exception:
             pass
             
@@ -58,14 +77,19 @@ class VideoWorker(QThread):
 
     def run(self):
         try:
-            subfolders = [p for p in self.parent_dir.iterdir() if p.is_dir()]
+            output_dir = self.parent_dir / "output_video"
+
+            # 出力先フォルダ自体は動画化の対象から外す
+            subfolders = [
+                p for p in self.parent_dir.iterdir()
+                if p.is_dir() and p != output_dir
+            ]
             total_folders = len(subfolders)
 
             if total_folders == 0:
                 self.log_updated.emit("サブフォルダが見つかりません。")
                 return
 
-            output_dir = self.parent_dir.parent / "OutputVideos"
             output_dir.mkdir(parents=True, exist_ok=True)
             parent_name = self.parent_dir.name
 
@@ -101,23 +125,17 @@ class VideoWorker(QThread):
                     temp_dir_path = Path(temp_dir)
                     temp_image_paths = []
 
-                    for idx, img_path in enumerate(image_paths):
-                        try:
-                            with Image.open(img_path) as img:
-                                # 縦写真が横に寝ないようにEXIFの回転情報を適用（HEICも対応）
-                                img = ImageOps.exif_transpose(img)
-                                # 3840x2160にリサイズ＆余白を黒で塗りつぶし
-                                img_padded = ImageOps.pad(img, (3840, 2160), color=(0, 0, 0))
-                                # エラー防止のためRGBモードに統一
-                                if img_padded.mode != 'RGB':
-                                    img_padded = img_padded.convert('RGB')
-                                
-                                temp_img_path = temp_dir_path / f"img_{idx:04d}.jpg"
-                                img_padded.save(temp_img_path, "JPEG", quality=95)
-                                temp_image_paths.append(temp_img_path)
-                        except Exception as e:
-                            self.log_updated.emit(f"画像読み込みエラー ({img_path.name}): {e}")
-                            continue
+                    # 全画像を並列で変換し、結果は元の並び順で受け取る
+                    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                        futures = [
+                            executor.submit(prepare_image, img_path, temp_dir_path / f"img_{idx:04d}.jpg")
+                            for idx, img_path in enumerate(image_paths)
+                        ]
+                        for img_path, future in zip(image_paths, futures):
+                            try:
+                                temp_image_paths.append(future.result())
+                            except Exception as e:
+                                self.log_updated.emit(f"画像読み込みエラー ({img_path.name}): {e}")
 
                     if not temp_image_paths:
                         self.log_updated.emit("有効な画像がありませんでした。スキップします。")
@@ -135,8 +153,9 @@ class VideoWorker(QThread):
                     output_filepath = output_dir / output_filename
                     log_file_path = output_dir / f"{output_filename}_ffmpeg_log.txt"
 
-                    # 画像はすでに4K化されているので、FFmpeg側でのリサイズはせずピクセルフォーマットと24fpsのみ指定
-                    vf_filter = "format=yuv420p,fps=10"
+                    # 画像はすでに4K化されているので、FFmpeg側でのリサイズはせずピクセルフォーマットと2fpsのみ指定
+                    # （1枚1秒の静止画なので2fpsで十分）
+                    vf_filter = "format=yuv420p,fps=2"
                     
                     cmd = [
                         "ffmpeg", "-y",
@@ -168,6 +187,10 @@ class VideoWorker(QThread):
                             lf.write(f"--- FFmpeg ログ ---\n{result.stderr}")
 
                         if result.returncode == 0:
+                            if oldest_date:
+                                # Finderの作成日・変更日も撮影日時にそろえる（APFSでは変更日を戻すと作成日も戻る）
+                                ts = oldest_date.timestamp()
+                                os.utime(output_filepath, (ts, ts))
                             self.log_updated.emit(f"完了: {output_filename}")
                             if "Drop" in result.stderr or "drop" in result.stderr or "Error" in result.stderr:
                                 self.log_updated.emit(f"⚠️ 警告: ログにDropやErrorの記載があります。")

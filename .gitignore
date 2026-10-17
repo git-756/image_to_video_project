@@ -8,3 +8,9 @@ wheels/
 
 # venv
 .venv
+
+# data
+*.jpg
+*.png
+*.mp4
+*.MOV

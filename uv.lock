@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 [[package]]
 name = "image-to-video-project"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "pillow" },
     { name = "pillow-heif" },
